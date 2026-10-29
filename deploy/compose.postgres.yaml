@@ -1,0 +1,106 @@
+# ---------------------------------------------------------------------------
+# 蒸馏平台 · 云端 / 多 worker 部署（PostgreSQL）
+#
+#   docker compose -f deploy/compose.postgres.yaml --env-file deploy/.env up -d
+#
+# 与 SQLite 版的差异只有三处：
+#   1. 数据库换成 PostgreSQL，worker 可以水平扩容；
+#   2. 任务抢占仍然走数据库队列，不引入 Redis/Celery；
+#   3. 向量检索回退到精确余弦（或自行启用 pgvector），不再依赖 sqlite-vec。
+# ---------------------------------------------------------------------------
+name: distill-platform-pg
+
+x-app: &app
+  image: distill-platform:${DISTILL_TAG:-local}
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+    args:
+      DISTILL_EXTRAS: ${DISTILL_EXTRAS:-}
+  env_file:
+    - .env
+  environment:
+    DISTILL_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-distill}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-distill}
+    DISTILL_INLINE_WORKER: "false"
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-distill}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-distill}
+      # 中文资料与混合检索需要稳定的排序规则
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-distill} -d ${POSTGRES_DB:-distill}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  api:
+    <<: *app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --forwarded-allow-ips
+      - "*"
+      - --timeout-graceful-shutdown
+      - "20"
+    ports:
+      - "${DISTILL_BIND:-127.0.0.1}:${DISTILL_PORT:-8000}:8000"
+    volumes:
+      - distill-data:/data
+      - distill-exports:/exports
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request, sys
+          sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8000/api/v1/ready", timeout=4).status == 200 else 1)
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 30s
+
+  worker:
+    <<: *app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy
+    command: ["python", "-m", "app.worker"]
+    volumes:
+      - distill-data:/data
+      - distill-exports:/exports
+    # 扩容用 --scale worker=N。每个 worker 通过 lease_epoch 围栏互不覆盖。
+    deploy:
+      replicas: ${DISTILL_WORKER_REPLICAS:-2}
+
+volumes:
+  pg-data:
+  distill-data:
+  distill-exports:

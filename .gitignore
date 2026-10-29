@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Local data and secrets
+data/
+exports/
+.env
+.env.local
+# 部署时从示例复制出的真实配置；示例本身（!.env.example）仍要提交
+deploy/.env
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.log
+.secrets/
+# 本地生成的密钥与备份
+backups/
+
+# Tooling scratch space (agent task scripts, screenshots)
+.workbuddy/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

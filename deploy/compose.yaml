@@ -1,0 +1,89 @@
+# ---------------------------------------------------------------------------
+# 蒸馏平台 · Docker Compose（默认：单主机 + SQLite，适合个人与局域网小团队）
+#
+#   cp deploy/.env.example deploy/.env
+#   docker compose -f deploy/compose.yaml --env-file deploy/.env up -d --build
+#
+# 升级到 PostgreSQL 时改用 compose.postgres.yaml，两者共享同一镜像。
+# ---------------------------------------------------------------------------
+name: distill-platform
+
+x-common: &common
+  image: distill-platform:${DISTILL_TAG:-local}
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+    args:
+      DISTILL_EXTRAS: ${DISTILL_EXTRAS:-}
+  env_file:
+    - .env
+  restart: unless-stopped
+
+services:
+  # 迁移作为一次性任务先跑完，API 与 worker 再启动。
+  # 这样避免每个进程各自争抢 DDL，也让"升级失败"表现为部署失败而不是运行期报错。
+  migrate:
+    <<: *common
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DISTILL_INLINE_WORKER: "false"
+    volumes:
+      - distill-data:/data
+      - distill-exports:/exports
+    restart: "no"
+
+  api:
+    <<: *common
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --forwarded-allow-ips
+      - "*"
+      - --timeout-graceful-shutdown
+      - "20"
+    environment:
+      # API 进程不跑 worker，避免与独立 worker 抢同一个 job。
+      DISTILL_INLINE_WORKER: "false"
+    ports:
+      - "${DISTILL_BIND:-127.0.0.1}:${DISTILL_PORT:-8000}:8000"
+    volumes:
+      - distill-data:/data
+      - distill-exports:/exports
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request, sys
+          sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8000/api/v1/ready", timeout=4).status == 200 else 1)
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 30s
+
+  worker:
+    <<: *common
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DISTILL_INLINE_WORKER: "false"
+    volumes:
+      - distill-data:/data
+      - distill-exports:/exports
+
+volumes:
+  distill-data:
+  distill-exports:

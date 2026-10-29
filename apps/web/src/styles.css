@@ -1,0 +1,278 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: 210 24% 97%;
+  --surface: 0 0% 100%;
+  --elevated: 210 25% 99%;
+  --border: 214 20% 89%;
+  --text: 222 32% 12%;
+  --muted: 215 14% 44%;
+  --primary: 174 72% 27%;
+  --primary-fg: 0 0% 100%;
+  --accent: 37 92% 50%;
+  --success: 152 55% 35%;
+  --warning: 32 92% 44%;
+  --danger: 0 70% 49%;
+  --info: 214 82% 50%;
+  --shadow: 220 40% 15%;
+}
+
+.dark {
+  --bg: 222 32% 8%;
+  --surface: 222 28% 11%;
+  --elevated: 222 26% 14%;
+  --border: 220 18% 20%;
+  --text: 210 20% 96%;
+  --muted: 215 14% 64%;
+  --primary: 172 62% 44%;
+  --primary-fg: 174 80% 8%;
+  --accent: 38 92% 55%;
+  --success: 152 50% 48%;
+  --warning: 35 90% 56%;
+  --danger: 0 72% 60%;
+  --info: 214 88% 66%;
+  --shadow: 0 0% 0%;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+html {
+  color-scheme: light;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  /* 之前这里写死 min-width: 1100px，导致平板、分屏和 iframe 嵌入场景
+     出现横向滚动。宽度下限改由布局组件在 lg 断点以下切换为抽屉导航承担。 */
+  background: hsl(var(--bg));
+  color: hsl(var(--text));
+  font-family: Inter, "Noto Sans SC", "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow-wrap: break-word;
+}
+
+/* 横向滚动的表格/代码块在窄屏不应撑破页面 */
+.min-w-0-fix {
+  min-width: 0;
+}
+
+::selection {
+  background: hsl(var(--primary) / 0.18);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted) / 0.25);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted) / 0.4);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+
+@layer components {
+  .card {
+    @apply rounded-2xl border bg-surface shadow-panel;
+  }
+
+  .card-hover {
+    @apply transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg;
+  }
+
+  .btn {
+    @apply inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-xl border border-transparent px-3.5 py-2 text-sm font-medium transition-all duration-150 disabled:pointer-events-none disabled:opacity-45;
+  }
+
+  .btn-primary {
+    @apply bg-primary text-primary-fg shadow-sm hover:brightness-110 active:brightness-95;
+  }
+
+  .btn-secondary {
+    @apply border-border bg-surface text-text hover:bg-elevated;
+  }
+
+  .btn-ghost {
+    @apply text-muted hover:bg-elevated hover:text-text;
+  }
+
+  .btn-danger {
+    @apply bg-danger text-white hover:brightness-110;
+  }
+
+  .btn-sm {
+    @apply rounded-lg px-2.5 py-1.5 text-xs;
+  }
+
+  .btn-lg {
+    @apply rounded-xl px-5 py-2.5 text-sm;
+  }
+
+  .input {
+    @apply h-10 w-full rounded-xl border border-border bg-surface px-3 text-sm text-text outline-none transition placeholder:text-muted/60 focus:border-primary/60 focus:ring-2 focus:ring-primary/15 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .textarea {
+    @apply min-h-[96px] w-full resize-y rounded-xl border border-border bg-surface px-3 py-2 text-sm text-text outline-none transition placeholder:text-muted/60 focus:border-primary/60 focus:ring-2 focus:ring-primary/15;
+  }
+
+  .select {
+    @apply h-10 w-full appearance-none rounded-xl border border-border bg-surface px-3 text-sm text-text outline-none transition focus:border-primary/60 focus:ring-2 focus:ring-primary/15;
+  }
+
+  .label {
+    @apply mb-1.5 block text-xs font-medium tracking-wide text-muted;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium leading-5;
+  }
+
+  .table {
+    @apply w-full border-collapse text-sm;
+  }
+
+  .table th {
+    @apply border-b border-border bg-elevated/60 px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider text-muted;
+  }
+
+  .table td {
+    @apply border-b border-border/60 px-4 py-3 align-middle;
+  }
+
+  .table tbody tr {
+    @apply transition-colors hover:bg-elevated/50;
+  }
+
+  .nav-link {
+    @apply flex items-center gap-3 rounded-xl px-3 py-2 text-sm font-medium text-muted transition-colors hover:bg-elevated hover:text-text;
+  }
+
+  .nav-link-active {
+    @apply bg-primary/10 text-primary hover:bg-primary/10 hover:text-primary;
+  }
+
+  .kbd {
+    @apply rounded-md border border-border bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-muted;
+  }
+
+  .tab-scroll {
+    scrollbar-width: none;
+  }
+
+  .tab-scroll::-webkit-scrollbar {
+    display: none;
+  }
+
+  .prose-skill {
+    @apply text-sm leading-7 text-text;
+  }
+
+  .prose-skill h1 {
+    @apply mb-3 mt-6 text-xl font-semibold;
+  }
+
+  .prose-skill h2 {
+    @apply mb-2 mt-5 text-base font-semibold;
+  }
+
+  .prose-skill h3 {
+    @apply mb-1.5 mt-4 text-sm font-semibold;
+  }
+
+  .prose-skill p {
+    @apply my-2 text-sm text-muted;
+  }
+
+  .prose-skill ul {
+    @apply my-2 list-disc space-y-1 pl-5 text-sm;
+  }
+
+  .prose-skill ol {
+    @apply my-2 list-decimal space-y-1 pl-5 text-sm;
+  }
+
+  .prose-skill code {
+    @apply rounded bg-elevated px-1 py-0.5 font-mono text-[12px];
+  }
+
+  .prose-skill pre {
+    @apply my-3 overflow-auto rounded-xl border bg-elevated p-3 font-mono text-xs leading-6;
+  }
+}
+
+@layer utilities {
+  .animate-in {
+    animation: animate-in 0.25s ease-out both;
+  }
+
+  .animate-rise {
+    animation: rise 0.35s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .shimmer {
+    background: linear-gradient(
+      90deg,
+      hsl(var(--elevated)) 0%,
+      hsl(var(--border) / 0.55) 50%,
+      hsl(var(--elevated)) 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.4s infinite;
+  }
+
+  .dot-grid {
+    background-image: radial-gradient(hsl(var(--border)) 1px, transparent 1px);
+    background-size: 18px 18px;
+  }
+
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+@keyframes animate-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}

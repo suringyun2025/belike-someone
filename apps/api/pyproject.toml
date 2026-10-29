@@ -1,0 +1,54 @@
+[project]
+name = "distill-platform-api"
+version = "0.2.0"
+description = "Persona and capability distillation platform - API and worker"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "suringyun" }]
+readme = { text = "See the repository README for usage.", content-type = "text/markdown" }
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.32,<1",
+  "sqlalchemy>=2.0,<3",
+  "pydantic>=2.9,<3",
+  "pydantic-settings>=2.6,<3",
+  "python-multipart>=0.0.12,<1",
+  "httpx>=0.27,<1",
+  "cryptography>=43,<47",
+  "pypdf>=5.1,<7",
+  "python-docx>=1.1,<2",
+  "openpyxl>=3.1,<4",
+  "beautifulsoup4>=4.12,<5",
+  "lxml>=5.3,<7",
+  "jieba>=0.42,<1",
+  "numpy>=1.26,<3",
+  "sqlite-vec>=0.1.9,<1",
+  "fastembed>=0.9,<1",
+  "alembic>=1.14,<2",
+]
+
+[project.optional-dependencies]
+ocr = [
+  "rapidocr-onnxruntime>=1.4,<2",
+  "pypdfium2>=4.30,<6",
+  "pillow>=10,<13",
+]
+asr = [
+  "faster-whisper>=1.1,<2",
+  "av>=14,<16",
+]
+postgres = [
+  "psycopg[binary]>=3.2,<4",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<2",
+  "respx>=0.22,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]

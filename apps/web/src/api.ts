@@ -1,4 +1,7 @@
 import type {
+  AuthConfig,
+  AuthSession,
+  AuthUser,
   Claim,
   Conflict,
   Dashboard,
@@ -14,6 +17,10 @@ import type {
   ProviderTestResult,
   ReadyCheck,
   RuntimeStats,
+  SandboxJoinResult,
+  SandboxMe,
+  SandboxState,
+  SandboxTicket,
   SearchResponse,
   Settings,
   Skill,
@@ -88,6 +95,36 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 const json = (body: unknown) => JSON.stringify(body);
 
 export const api = {
+  // --- sandbox (public demo) ----------------------------------------------
+  sandboxState: () => request<SandboxState>("/sandbox"),
+  sandboxJoin: (body: {
+    base_url: string;
+    protocol: string;
+    model_id: string;
+    api_key: string;
+    nickname?: string;
+  }) => request<SandboxJoinResult>("/sandbox/join", { method: "POST", body: json(body) }),
+  sandboxTicket: (ticketId: string, fingerprint = "") =>
+    request<{ state: string; ticket: SandboxTicket; fingerprint: string }>(
+      `/sandbox/ticket/${ticketId}${fingerprint ? `?fingerprint=${fingerprint}` : ""}`,
+    ),
+  sandboxClaim: (body: { ticket_id: string; fingerprint: string }) =>
+    request<SandboxJoinResult>("/sandbox/claim", { method: "POST", body: json(body) }),
+  sandboxMe: () => request<SandboxMe>("/sandbox/me"),
+  sandboxExit: () => request<void>("/sandbox/exit", { method: "POST" }),
+
+  // --- auth ---------------------------------------------------------------
+  authConfig: () => request<AuthConfig>("/auth/config"),
+  me: () => request<AuthUser>("/auth/me"),
+  login: (body: { email: string; password: string }) =>
+    request<AuthUser>("/auth/login", { method: "POST", body: json(body) }),
+  register: (body: { email: string; password: string; display_name?: string }) =>
+    request<AuthUser>("/auth/register", { method: "POST", body: json(body) }),
+  logout: () => request<void>("/auth/logout", { method: "POST" }),
+  changePassword: (body: { current_password: string; new_password: string }) =>
+    request<void>("/auth/password", { method: "POST", body: json(body) }),
+  sessions: () => request<AuthSession[]>("/auth/sessions"),
+
   health: () => request<{ status: string; version: string; database: string }>("/health"),
   ready: () => request<ReadyCheck>("/ready"),
   stats: () => request<RuntimeStats>("/stats"),

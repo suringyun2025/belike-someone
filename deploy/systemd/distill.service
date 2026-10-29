@@ -1,0 +1,59 @@
+[Unit]
+Description=Distill Platform (persona distillation studio)
+Documentation=https://github.com/suringyun2025/belike-someone
+After=network-online.target
+Wants=network-online.target
+# Never let a crash loop spin forever without surfacing it.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/distill
+EnvironmentFile=/opt/distill/.env
+# Bind to loopback only: nginx is the sole public entry point.
+# The venv lives next to the API package (uv project layout), not at the repo root.
+ExecStart=/opt/distill/apps/api/.venv/bin/python -m uvicorn app.main:app \
+    --app-dir apps/api \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --proxy-headers \
+    --forwarded-allow-ips 127.0.0.1 \
+    --timeout-graceful-shutdown 20 \
+    --no-access-log
+Restart=always
+RestartSec=5
+# Graceful stop: give in-flight jobs time to finish their stage.
+TimeoutStopSec=45
+KillSignal=SIGTERM
+
+# --- resource guards (small host) -----------------------------------------
+# The scheduler already limits concurrency to 1 job; these are the outer fence
+# so a pathological input cannot take the whole box down.
+MemoryHigh=850M
+MemoryMax=1200M
+TasksMax=256
+Nice=5
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/opt/distill/data /opt/distill/exports /opt/distill/app.log
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+
+# --- logging ---------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=distill
+
+[Install]
+WantedBy=multi-user.target

@@ -4,9 +4,11 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from ..config import settings
 from ..db import get_db
+from ..deps import current_user
 from ..ingest import create_source_from_file
-from ..models import AuditEvent, Claim, Job, Project, Skill, Source
+from ..models import AuditEvent, Claim, Job, Project, Skill, Source, User
 from ..schemas import DashboardOut, DemoOut
 from .common import project_out
 
@@ -61,30 +63,53 @@ DEMO_CHAT = """{"sender":"架构师","timestamp":"2026-03-02 10:12","content":"�
 
 
 @router.get("/dashboard", response_model=DashboardOut)
-def dashboard(db: Session = Depends(get_db)):
+def dashboard(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Aggregates for the landing page.
+
+    Counts are scoped with a correlated ``EXISTS`` instead of ``IN (subquery)``
+    inside ``select_from(model)``: the latter makes SQLAlchemy add the subquery's
+    table as a second FROM element, yielding a cartesian product.
+    """
+    from sqlalchemy import exists
+
+    multi = settings.multiuser
+    project_filter: list = [Project.deleted_at.is_(None)]
+    if multi:
+        project_filter.append(Project.owner_id == user.id)
     projects = db.scalars(
-        select(Project).where(Project.deleted_at.is_(None)).order_by(Project.updated_at.desc()).limit(5)
+        select(Project).where(*project_filter).order_by(Project.updated_at.desc()).limit(5)
     ).all()
-    recent_jobs = db.scalars(select(Job).order_by(Job.created_at.desc()).limit(6)).all()
+
+    def _owned(model):
+        condition = Project.id == model.project_id
+        if multi:
+            condition = condition & (Project.owner_id == user.id)
+        return exists(select(Project.id).where(condition, Project.deleted_at.is_(None)))
+
+    jobs_query = select(Job)
+    if multi:
+        jobs_query = jobs_query.where(_owned(Job))
+    recent_jobs = db.scalars(jobs_query.order_by(Job.created_at.desc()).limit(6)).all()
+
+    def _count(model, *where):
+        stmt = select(func.count()).select_from(model)
+        if where:
+            stmt = stmt.where(*where)
+        return db.scalar(stmt) or 0
+
+    scope = [_owned] if multi else []
+
     return DashboardOut(
-        projects=db.scalar(
-            select(func.count()).select_from(Project).where(Project.deleted_at.is_(None))
-        )
-        or 0,
-        sources=db.scalar(select(func.count()).select_from(Source)) or 0,
-        claims_pending=db.scalar(
-            select(func.count()).select_from(Claim).where(Claim.status == "proposed")
-        )
-        or 0,
-        skills=db.scalar(select(func.count()).select_from(Skill)) or 0,
-        jobs_running=db.scalar(
-            select(func.count()).select_from(Job).where(Job.status.in_(["queued", "running", "paused"]))
-        )
-        or 0,
-        jobs_failed=db.scalar(
-            select(func.count()).select_from(Job).where(Job.status == "failed")
-        )
-        or 0,
+        projects=_count(Project, *project_filter),
+        sources=_count(Source, *[f(Source) for f in scope]),
+        claims_pending=_count(
+            Claim, *[f(Claim) for f in scope], Claim.status == "proposed"
+        ),
+        skills=_count(Skill, *[f(Skill) for f in scope]),
+        jobs_running=_count(
+            Job, *[f(Job) for f in scope], Job.status.in_(["queued", "running", "paused"])
+        ),
+        jobs_failed=_count(Job, *[f(Job) for f in scope], Job.status == "failed"),
         recent_projects=[
             project_out(db, project).model_dump(mode="json") for project in projects
         ],
@@ -104,8 +129,9 @@ def dashboard(db: Session = Depends(get_db)):
 
 
 @router.post("/demo", response_model=DemoOut, status_code=201)
-def create_demo(db: Session = Depends(get_db)):
+def create_demo(db: Session = Depends(get_db), user: User = Depends(current_user)):
     project = Project(
+        owner_id=user.id,
         name="示例项目：解决方案架构师",
         codename="示例架构师",
         purpose="演示如何从工作笔记和聊天记录中蒸馏专业能力、决策方式与表达风格。",
@@ -135,6 +161,8 @@ def create_demo(db: Session = Depends(get_db)):
     db.add(
         AuditEvent(
             project_id=project.id,
+            actor_id=user.id,
+            actor=user.email,
             action="demo.create",
             detail={"source_id": source.id},
         )

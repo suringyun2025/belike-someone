@@ -71,6 +71,71 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_json: bool = False
 
+    # --- Concurrency control (strict queueing) ----------------------------
+    # Hard cap on simultaneously running jobs. Each distillation job holds
+    # parsed text plus (optionally) an ONNX embedding model in memory, so this
+    # must reflect real RAM, not CPU count. Default 1 is safe on a 1-2 GB host.
+    max_concurrent_jobs: int = 1
+    # Per-account cap, so one user cannot occupy every slot.
+    max_jobs_per_user: int = 1
+    # Refuse to start a job when available memory drops below this floor (MiB).
+    # Set to 0 to disable the check.
+    min_free_mb: int = 320
+    # Above this many waiting jobs the API returns 429 instead of accepting more.
+    # A short queue is honest; an hour-long one is a lie about availability.
+    max_queue_length: int = 30
+    # Reject uploads that would push a user past this total (enforced in the
+    # upload handler alongside max_storage_mb_per_user).
+    enforce_storage_quota: bool = True
+
+    # --- Multi-user / public deployment -----------------------------------
+    # When True every business endpoint requires a logged-in user and data is
+    # scoped by owner_id. The single-user local build leaves this off so the
+    # existing workflow keeps working without a login step.
+    multiuser: bool = False
+    allow_registration: bool = False
+    session_days: int = 14
+    cookie_secure: bool = True
+    cookie_samesite: str = "lax"
+    cookie_domain: str = ""
+    # Bootstrap admin created on first start when multiuser is on and no user
+    # exists. Leave the password empty to have one generated and logged once.
+    admin_email: str = "admin@localhost"
+    admin_password: str = ""
+    # Fernet key or passphrase for sealing provider credentials. Must be stable:
+    # rotating it makes every stored API key undecryptable.
+    secret_key: str = ""
+
+    # Abuse limits (applied per user and per IP).
+    max_login_attempts: int = 8
+    login_window_seconds: int = 300
+    rate_limit_per_minute: int = 120
+    max_projects_per_user: int = 20
+    max_jobs_per_user: int = 2
+    max_storage_mb_per_user: int = 2048
+
+    # --- Public demo sandbox -----------------------------------------------
+    # The public instance runs one visitor at a time: they bring their own model
+    # endpoint, use the seat, and everything they create is deleted on exit.
+    # This is a different product from the multiuser build, not a mode of it.
+    sandbox: bool = False
+    # Hard cap on a single turn. Long enough to run a real distillation and read
+    # the result; short enough that the queue behind them moves.
+    sandbox_visit_minutes: int = 30
+    # Idle cutoff: a tab left open without requests stops holding the seat.
+    sandbox_idle_minutes: int = 10
+    # Public deployments should refuse plain http endpoints for the model API.
+    sandbox_https_only: bool = True
+    # Escape hatch for local development: lets the entry form point at a mock
+    # endpoint on 127.0.0.1. Never enable this on a public instance — it is the
+    # SSRF guard's off switch.
+    sandbox_allow_private: bool = False
+    sandbox_max_projects: int = 3
+    sandbox_max_storage_mb: int = 256
+    # A visitor may start this many jobs per turn; the worker still runs one at
+    # a time, so this is a patience limit, not a parallelism one.
+    sandbox_max_jobs: int = 12
+
     model_config = SettingsConfigDict(
         env_file=str(ROOT_DIR / ".env"),
         env_prefix="DISTILL_",
@@ -84,6 +149,16 @@ class Settings(BaseSettings):
             import socket
 
             self.worker_id = f"{socket.gethostname()}-{os.getpid()}"
+        # Sandbox is a tenancy mode, not a separate auth path: visitors own their
+        # own workspace, so every ownership check must stay on. Folding it into
+        # ``multiuser`` here means the ~20 call sites that guard on that flag do
+        # not each need a second condition to forget.
+        if self.sandbox and not self.multiuser:
+            self.multiuser = True
+        # Registration is meaningless in a sandbox: identity comes from the seat,
+        # not from an account someone creates.
+        if self.sandbox:
+            self.allow_registration = False
 
     @property
     def sources_dir(self) -> Path:

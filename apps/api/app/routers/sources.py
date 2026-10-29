@@ -11,8 +11,9 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
+from ..deps import current_user, owned_project
 from ..ingest import create_source_from_file, invalidate_source_evidence, parse_source, reparse_source
-from ..models import AuditEvent, Chunk, Project, Source
+from ..models import AuditEvent, Chunk, Document, Project, Source, User
 from ..schemas import SourceOut
 from ..security import sha256_file
 from ..storage import detect_source_type, safe_extract_zip
@@ -23,17 +24,21 @@ router = APIRouter(tags=["sources"])
 CHUNK = 1024 * 1024
 
 
-def _get_project(db: Session, project_id: str) -> Project:
-    project = db.get(Project, project_id)
-    if not project or project.deleted_at is not None:
-        raise HTTPException(status_code=404, detail="项目不存在")
-    return project
+def _get_project(db: Session, project_id: str, user: User) -> Project:
+    return owned_project(project_id, db, user)
 
 
-def _get_source(db: Session, source_id: str) -> Source:
+def _get_source(db: Session, source_id: str, user: User) -> Source:
+    """Resolve a source and verify the caller owns its project.
+
+    Child resources are never returned on the strength of their own id alone:
+    the lookup walks back to the project and re-checks ownership, which closes
+    the IDOR hole that a bare ``db.get(Source, id)`` would leave open.
+    """
     source = db.get(Source, source_id)
     if not source:
         raise HTTPException(status_code=404, detail="资料不存在")
+    owned_project(source.project_id, db, user)
     return source
 
 
@@ -74,8 +79,10 @@ def _spool_upload(upload: UploadFile, max_bytes: int) -> Path:
 
 
 @router.get("/projects/{project_id}/sources", response_model=list[SourceOut])
-def list_sources(project_id: str, db: Session = Depends(get_db)):
-    _get_project(db, project_id)
+def list_sources(
+    project_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    _get_project(db, project_id, user)
     sources = db.scalars(
         select(Source).where(Source.project_id == project_id).order_by(Source.created_at.desc())
     ).all()
@@ -87,8 +94,9 @@ def upload_sources(
     project_id: str,
     files: list[UploadFile],
     db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
-    project = _get_project(db, project_id)
+    project = _get_project(db, project_id, user)
     created: list[Source] = []
     max_bytes = settings.max_upload_mb * 1024 * 1024
     spooled: list[Path] = []
@@ -168,13 +176,17 @@ def upload_sources(
 
 
 @router.get("/sources/{source_id}", response_model=SourceOut)
-def get_source(source_id: str, db: Session = Depends(get_db)):
-    return source_out(db, _get_source(db, source_id))
+def get_source(
+    source_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    return source_out(db, _get_source(db, source_id, user))
 
 
 @router.get("/sources/{source_id}/preview")
-def preview_source(source_id: str, db: Session = Depends(get_db)):
-    source = _get_source(db, source_id)
+def preview_source(
+    source_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    source = _get_source(db, source_id, user)
     blocks = []
     for document in source.documents:
         for block in document.blocks:
@@ -199,8 +211,10 @@ def preview_source(source_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/sources/{source_id}/chunks")
-def list_chunks(source_id: str, db: Session = Depends(get_db)):
-    source = _get_source(db, source_id)
+def list_chunks(
+    source_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    source = _get_source(db, source_id, user)
     chunks = db.scalars(
         select(Chunk).where(Chunk.source_id == source.id).order_by(Chunk.order_index)
     ).all()
@@ -223,7 +237,12 @@ def list_chunks(source_id: str, db: Session = Depends(get_db)):
 
 
 @router.patch("/chunks/{chunk_id}")
-def update_chunk(chunk_id: str, payload: dict, db: Session = Depends(get_db)):
+def update_chunk(
+    chunk_id: str,
+    payload: dict,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     """Exclude or re-include a chunk so it never reaches the LLM again.
 
     Excluding a chunk also retires claims whose only evidence came from it,
@@ -232,6 +251,7 @@ def update_chunk(chunk_id: str, payload: dict, db: Session = Depends(get_db)):
     chunk = db.get(Chunk, chunk_id)
     if not chunk:
         raise HTTPException(status_code=404, detail="文本块不存在")
+    owned_project(chunk.project_id, db, user)
     if "excluded" in payload:
         chunk.excluded = bool(payload["excluded"])
         db.add(chunk)
@@ -248,8 +268,10 @@ def update_chunk(chunk_id: str, payload: dict, db: Session = Depends(get_db)):
 
 
 @router.post("/sources/{source_id}/parse", response_model=SourceOut)
-def parse_source_endpoint(source_id: str, db: Session = Depends(get_db)):
-    source = _get_source(db, source_id)
+def parse_source_endpoint(
+    source_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    source = _get_source(db, source_id, user)
     source = reparse_source(db, source)
     db.add(
         AuditEvent(
@@ -263,8 +285,10 @@ def parse_source_endpoint(source_id: str, db: Session = Depends(get_db)):
 
 
 @router.delete("/sources/{source_id}", status_code=204)
-def delete_source(source_id: str, db: Session = Depends(get_db)):
-    source = _get_source(db, source_id)
+def delete_source(
+    source_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    source = _get_source(db, source_id, user)
     project_id = source.project_id
     path = Path(source.storage_path)
     invalidated = invalidate_source_evidence(db, source.id)

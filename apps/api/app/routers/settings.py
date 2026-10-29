@@ -6,8 +6,9 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
+from ..deps import current_user
 from ..llm import PROTOCOL_LABELS, capabilities_for
-from ..models import Job, Project, Provider, Skill, Source
+from ..models import Job, Project, Provider, Skill, Source, User
 from ..prompts import DIMENSION_LABELS
 from ..schemas import SettingsOut
 from ..version import PIPELINE_VERSION
@@ -51,7 +52,7 @@ def meta():
 
 
 @router.get("/usage")
-def usage_overview(db: Session = Depends(get_db)):
+def usage_overview(db: Session = Depends(get_db), user: User = Depends(current_user)):
     """Aggregate provider token usage per project.
 
     Only totals that a provider actually reported are summed. When no model has
@@ -59,7 +60,13 @@ def usage_overview(db: Session = Depends(get_db)):
     show "未统计" rather than a fabricated 0.
     """
     rows: dict[str, dict] = {}
-    jobs = db.scalars(select(Job)).all()
+    jobs_query = select(Job)
+    if settings.multiuser:
+        # Only jobs belonging to the caller's projects; usage is billing data.
+        jobs_query = jobs_query.where(
+            Job.project_id.in_(select(Project.id).where(Project.owner_id == user.id))
+        )
+    jobs = db.scalars(jobs_query).all()
     for job in jobs:
         usage = job.usage or {}
         totals = usage.get("totals") or {}
@@ -90,10 +97,15 @@ def usage_overview(db: Session = Depends(get_db)):
             for key in ("input_tokens", "output_tokens", "total_tokens"):
                 bucket[key] += int(model_usage.get(key) or 0)
 
-    projects = {
-        project.id: project.name
-        for project in db.scalars(select(Project).where(Project.id.in_(list(rows)))).all()
-    } if rows else {}
+    if rows:
+        project_scope = select(Project).where(Project.id.in_(list(rows)))
+        if settings.multiuser:
+            project_scope = project_scope.where(Project.owner_id == user.id)
+        projects = {project.id: project.name for project in db.scalars(project_scope).all()}
+        # Drop any id that escaped the scope (defence in depth).
+        rows = {key: value for key, value in rows.items() if key in projects}
+    else:
+        projects = {}
     for project_id, entry in rows.items():
         entry["project_name"] = projects.get(project_id, project_id)
 
@@ -111,17 +123,46 @@ def usage_overview(db: Session = Depends(get_db)):
 
 
 @router.get("/stats")
-def stats(db: Session = Depends(get_db)):
-    """Single query endpoint for the dashboard health strip."""
+def stats(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Single endpoint for the dashboard health strip.
+
+    Tenant scoping uses an explicit ``EXISTS`` subquery rather than
+    ``IN (SELECT ...)`` inside a ``select_from(model)``: mixing the two makes
+    SQLAlchemy treat the subquery's table as a second FROM element, which
+    produces a cartesian product and inflates every count.
+    """
+    multi = settings.multiuser
+
+    def _owned_project_exists(model) -> object:
+        """Correlate ``model.project_id`` to a project the caller owns."""
+        from sqlalchemy import exists
+
+        condition = Project.id == model.project_id
+        if multi:
+            condition = condition & (Project.owner_id == user.id)
+        return exists(select(Project.id).where(condition, Project.deleted_at.is_(None)))
+
+    def _count(model, *where):
+        stmt = select(func.count()).select_from(model)
+        if where:
+            stmt = stmt.where(*where)
+        return db.scalar(stmt) or 0
+
+    project_where: list = [Project.deleted_at.is_(None)]
+    if multi:
+        project_where.append(Project.owner_id == user.id)
+
+    scoped = [_owned_project_exists] if multi else []
+
     counts = {
-        "projects": db.scalar(select(func.count()).select_from(Project)) or 0,
-        "sources": db.scalar(select(func.count()).select_from(Source)) or 0,
-        "skills": db.scalar(select(func.count()).select_from(Skill)) or 0,
-        "providers": db.scalar(select(func.count()).select_from(Provider)) or 0,
-        "jobs": db.scalar(select(func.count()).select_from(Job)) or 0,
-        "jobs_active": db.scalar(
-            select(func.count()).select_from(Job).where(Job.status.in_(["queued", "running"]))
-        ) or 0,
+        "projects": _count(Project, *project_where),
+        "sources": _count(Source, *[f(Source) for f in scoped]),
+        "skills": _count(Skill, *[f(Skill) for f in scoped]),
+        "providers": _count(Provider, *([Provider.owner_id == user.id] if multi else [])),
+        "jobs": _count(Job, *[f(Job) for f in scoped]),
+        "jobs_active": _count(
+            Job, *[f(Job) for f in scoped], Job.status.in_(["queued", "running"])
+        ),
     }
     return {
         **counts,

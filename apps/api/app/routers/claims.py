@@ -5,18 +5,25 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from ..db import get_db
-from ..models import AuditEvent, Claim, Conflict, Project
+from ..deps import current_user, owned_project
+from ..models import AuditEvent, Claim, Conflict, Project, User
 from ..schemas import BulkReviewRequest, ClaimOut, ClaimPatch, ConflictOut, ConflictPatch
 from .common import claim_out
 
 router = APIRouter(tags=["claims"])
 
 
-def _get_project(db: Session, project_id: str) -> Project:
-    project = db.get(Project, project_id)
-    if not project or project.deleted_at is not None:
-        raise HTTPException(status_code=404, detail="项目不存在")
-    return project
+def _get_project(db: Session, project_id: str, user: User) -> Project:
+    return owned_project(project_id, db, user)
+
+
+def _get_claim(db: Session, claim_id: str, user: User) -> Claim:
+    """Resolve a claim and verify its project belongs to the caller."""
+    claim = db.get(Claim, claim_id)
+    if not claim:
+        raise HTTPException(status_code=404, detail="断言不存在")
+    owned_project(claim.project_id, db, user)
+    return claim
 
 
 @router.get("/projects/{project_id}/claims", response_model=list[ClaimOut])
@@ -25,8 +32,9 @@ def list_claims(
     status: str | None = None,
     dimension: str | None = None,
     db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
-    _get_project(db, project_id)
+    _get_project(db, project_id, user)
     query = (
         select(Claim)
         .where(Claim.project_id == project_id)
@@ -43,22 +51,31 @@ def list_claims(
 
 
 @router.get("/claims/{claim_id}", response_model=ClaimOut)
-def get_claim(claim_id: str, db: Session = Depends(get_db)):
+def get_claim(
+    claim_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
     claim = db.scalar(
         select(Claim).where(Claim.id == claim_id).options(selectinload(Claim.evidence))
     )
     if not claim:
         raise HTTPException(status_code=404, detail="断言不存在")
+    owned_project(claim.project_id, db, user)
     return claim_out(claim)
 
 
 @router.patch("/claims/{claim_id}", response_model=ClaimOut)
-def update_claim(claim_id: str, payload: ClaimPatch, db: Session = Depends(get_db)):
+def update_claim(
+    claim_id: str,
+    payload: ClaimPatch,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     claim = db.scalar(
         select(Claim).where(Claim.id == claim_id).options(selectinload(Claim.evidence))
     )
     if not claim:
         raise HTTPException(status_code=404, detail="断言不存在")
+    owned_project(claim.project_id, db, user)
     data = payload.model_dump(exclude_unset=True)
     for key, value in data.items():
         setattr(claim, key, value)
@@ -76,8 +93,13 @@ def update_claim(claim_id: str, payload: ClaimPatch, db: Session = Depends(get_d
 
 
 @router.post("/projects/{project_id}/claims/bulk-review")
-def bulk_review(project_id: str, payload: BulkReviewRequest, db: Session = Depends(get_db)):
-    _get_project(db, project_id)
+def bulk_review(
+    project_id: str,
+    payload: BulkReviewRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    _get_project(db, project_id, user)
     claims = db.scalars(
         select(Claim).where(
             Claim.project_id == project_id, Claim.id.in_(payload.claim_ids)
@@ -102,8 +124,10 @@ def bulk_review(project_id: str, payload: BulkReviewRequest, db: Session = Depen
 
 
 @router.get("/projects/{project_id}/conflicts", response_model=list[ConflictOut])
-def list_conflicts(project_id: str, db: Session = Depends(get_db)):
-    _get_project(db, project_id)
+def list_conflicts(
+    project_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    _get_project(db, project_id, user)
     conflicts = db.scalars(
         select(Conflict)
         .where(Conflict.project_id == project_id)
@@ -114,10 +138,16 @@ def list_conflicts(project_id: str, db: Session = Depends(get_db)):
 
 
 @router.patch("/conflicts/{conflict_id}", response_model=ConflictOut)
-def update_conflict(conflict_id: str, payload: ConflictPatch, db: Session = Depends(get_db)):
+def update_conflict(
+    conflict_id: str,
+    payload: ConflictPatch,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     conflict = db.get(Conflict, conflict_id)
     if not conflict:
         raise HTTPException(status_code=404, detail="冲突不存在")
+    owned_project(conflict.project_id, db, user)
     conflict.status = payload.status
     conflict.resolution = payload.resolution
     db.add(conflict)

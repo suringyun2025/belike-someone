@@ -9,6 +9,49 @@ Protocol = Literal["openai_responses", "openai_chat", "anthropic", "gemini"]
 Dimension = Literal["professional", "decision", "workflow", "style", "boundary", "knowledge"]
 
 
+class SandboxJoinRequest(BaseModel):
+    """A visitor's own model endpoint.
+
+    The key arrives in the body over TLS, is sealed immediately, and is never
+    echoed back. ``base_url`` is vetted server-side (see ``sandbox.validate_endpoint``)
+    because the server is the one that will call it.
+    """
+
+    base_url: str = Field(min_length=1, max_length=500)
+    protocol: Protocol = "openai_chat"
+    model_id: str = Field(min_length=1, max_length=300)
+    api_key: str = Field(min_length=8, max_length=500)
+    nickname: str = Field(default="", max_length=60)
+
+
+class SandboxClaimRequest(BaseModel):
+    ticket_id: str
+    fingerprint: str
+
+
+class SandboxJoinOut(BaseModel):
+    """Result of joining: either seated, or holding a ticket.
+
+    ``state`` is ``active`` or ``queued``. ``session_token`` is present only when
+    active; it is also set as an HttpOnly cookie, so the SPA does not need it.
+    """
+
+    state: str
+    visit: dict[str, Any] | None = None
+    ticket: dict[str, Any] | None = None
+    session_token: str = ""
+    probe: dict[str, Any] = {}
+
+
+class SandboxStateOut(BaseModel):
+    enabled: bool = True
+    state: str = "free"
+    occupant: dict[str, Any] | None = None
+    waiting: int = 0
+    visit_minutes: int = 0
+    protocols: list[dict[str, str]] = []
+
+
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     codename: str = ""
@@ -143,6 +186,11 @@ class JobOut(BaseModel):
     finished_at: datetime | None
     worker_id: str = ""
     usage: dict[str, Any] = {}
+    # Queue visibility: lets the UI explain *why* a job has not started yet
+    # instead of showing an indefinite spinner.
+    queue_position: int = 0
+    queue_ahead: int = 0
+    queue_reason: str = ""
     stages: list[StageOut] = []
 
 
@@ -280,6 +328,37 @@ class HealthOut(BaseModel):
     status: str
     version: str
     database: str
+
+
+# --- auth -----------------------------------------------------------------
+
+
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=200)
+    display_name: str = Field(default="", max_length=120)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=1, max_length=200)
+
+
+class UserOut(BaseModel):
+    id: str
+    email: str
+    display_name: str
+    is_admin: bool
+    max_projects: int
+    max_storage_mb: int
+    project_count: int = 0
+    last_login_at: datetime | None = None
+    created_at: datetime
 
 
 class SettingsOut(BaseModel):

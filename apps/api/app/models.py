@@ -38,6 +38,95 @@ class TimestampMixin:
     )
 
 
+class User(TimestampMixin, Base):
+    """A tenant boundary.
+
+    Every project, provider and job belongs to exactly one user. Access control
+    is enforced by always filtering on ``owner_id`` rather than by hiding UI.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("usr"))
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    # Argon2id digest, never the plaintext password.
+    password_hash: Mapped[str] = mapped_column(Text)
+    display_name: Mapped[str] = mapped_column(String(120), default="")
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    disabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Quota fields are per-user so one account cannot exhaust the server.
+    max_projects: Mapped[int] = mapped_column(Integer, default=20)
+    max_storage_mb: Mapped[int] = mapped_column(Integer, default=2048)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    projects: Mapped[list["Project"]] = relationship(back_populates="owner")
+
+
+class Session(Base):
+    """Server-side session.
+
+    Only a SHA-256 hash of the bearer token is stored, so a database leak does
+    not hand an attacker usable sessions.
+    """
+
+    __tablename__ = "sessions"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("ses"))
+    user_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    ip: Mapped[str] = mapped_column(String(64), default="")
+    user_agent: Mapped[str] = mapped_column(String(400), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Visit(Base):
+    """One visitor's turn on the shared demo seat.
+
+    The public instance serves one person at a time: a visitor brings their own
+    model endpoint, uses the workbench alone, and leaves. This row is that turn.
+
+    ``status`` moves ``queued`` → ``ready`` → ``active`` → ``closed``; a ticket
+    that is never claimed lands in ``expired``. Everything the visit creates is
+    deleted when it reaches a terminal state, including the sealed API key, so
+    the only durable trace is this row's timestamps and close reason.
+    """
+
+    __tablename__ = "visits"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("vst"))
+    # Points at the guest user once the visit is active. Queued tickets carry a
+    # placeholder so promotion can fill it in a single statement.
+    owner_id: Mapped[str] = mapped_column(String(60), default="", index=True)
+    nickname: Mapped[str] = mapped_column(String(60), default="")
+    protocol: Mapped[str] = mapped_column(String(40), default="openai_chat")
+    model_id: Mapped[str] = mapped_column(String(300), default="")
+    base_url: Mapped[str] = mapped_column(Text, default="")
+    # Sealed with the AAD literal "queue" while queued, then re-sealed under the
+    # real owner id once the visit becomes active. Binding the ciphertext to an
+    # owner means a copied value fails to decrypt instead of leaking a key.
+    api_key_encrypted: Mapped[str] = mapped_column(Text, default="")
+    # SHA-256 of base_url+key, so a refresh keeps its place in line without
+    # storing the credential itself in a queryable form.
+    fingerprint: Mapped[str] = mapped_column(String(64), default="", index=True)
+    provider_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Hard stop for the turn. Also the session cookie's expiry.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    # Short window a promoted ticket has to claim the seat. Without it, a closed
+    # tab would hold the front of the queue indefinitely.
+    claim_deadline: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    close_reason: Mapped[str] = mapped_column(String(40), default="")
+
+
 class Project(TimestampMixin, Base):
     __tablename__ = "projects"
 
@@ -52,8 +141,14 @@ class Project(TimestampMixin, Base):
     provider_id: Mapped[str | None] = mapped_column(
         String(40), ForeignKey("providers.id", ondelete="SET NULL"), nullable=True
     )
+    # Tenant boundary. NULL only exists on databases created before multiuser
+    # support; the migration claims those rows for the first admin.
+    owner_id: Mapped[str | None] = mapped_column(
+        String(40), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    owner: Mapped["User"] = relationship(back_populates="projects")
     sources: Mapped[list[Source]] = relationship(back_populates="project", cascade="all, delete-orphan")
     claims: Mapped[list[Claim]] = relationship(back_populates="project", cascade="all, delete-orphan")
     jobs: Mapped[list[Job]] = relationship(back_populates="project", cascade="all, delete-orphan")
@@ -171,6 +266,11 @@ class Provider(TimestampMixin, Base):
     __tablename__ = "providers"
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("prv"))
+    # Each user owns their own credentials. A provider is never shared across
+    # tenants: sharing would let one account spend another account's quota.
+    owner_id: Mapped[str | None] = mapped_column(
+        String(40), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(200))
     protocol: Mapped[str] = mapped_column(String(40), index=True)
     base_url: Mapped[str] = mapped_column(Text)
@@ -249,6 +349,10 @@ class Job(TimestampMixin, Base):
     id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("job"))
     project_id: Mapped[str] = mapped_column(
         String(40), ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    # Denormalised for cheap per-user quota checks and SSE authorisation.
+    owner_id: Mapped[str | None] = mapped_column(
+        String(40), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
     kind: Mapped[str] = mapped_column(String(40), default="distill")
     status: Mapped[str] = mapped_column(String(40), default="queued", index=True)
@@ -362,8 +466,12 @@ class AuditEvent(Base):
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("aud"))
     project_id: Mapped[str | None] = mapped_column(String(40), index=True, nullable=True)
+    # Who performed the action. NULL only for pre-multiuser rows.
+    actor_id: Mapped[str | None] = mapped_column(String(40), index=True, nullable=True)
     action: Mapped[str] = mapped_column(String(120))
     actor: Mapped[str] = mapped_column(String(120), default="local-user")
+    ip: Mapped[str] = mapped_column(String(64), default="")
+    user_agent: Mapped[str] = mapped_column(String(400), default="")
     detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

@@ -132,6 +132,9 @@ export interface Job {
     totals?: Record<string, number>;
     by_model?: Record<string, Record<string, number>>;
   };
+  queue_position: number;
+  queue_ahead: number;
+  queue_reason: string;
   stages: Stage[];
 }
 
@@ -399,4 +402,83 @@ export interface ReadyCheck {
   status: string;
   version: string;
   checks: Record<string, any>;
+}
+
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  display_name: string;
+  is_admin: boolean;
+  max_projects: number;
+  max_storage_mb: number;
+  project_count: number;
+  last_login_at: string | null;
+  created_at: string;
+}
+
+export interface AuthConfig {
+  multiuser: boolean;
+  sandbox: boolean;
+  allow_registration: boolean;
+  session_days: number;
+  email_verification: boolean;
+}
+
+export interface AuthSession {
+  id: string;
+  ip: string;
+  user_agent: string;
+  created_at: string;
+  expires_at: string;
+  expired: boolean;
+}
+
+
+export interface SandboxTicket {
+  ticket_id: string;
+  fingerprint?: string;
+  status?: string;
+  position: number;
+  ahead: number;
+  estimated_wait_seconds: number;
+  claimable?: boolean;
+  expires_at?: string | null;
+}
+
+export interface SandboxOccupant {
+  id: string;
+  nickname: string;
+  model_id?: string;
+  seconds_left: number;
+  expires_at?: string | null;
+}
+
+export interface SandboxState {
+  enabled: boolean;
+  state: "free" | "busy";
+  occupant?: SandboxOccupant | null;
+  waiting: number;
+  visit_minutes: number;
+  protocols?: { value: string; label: string }[];
+}
+
+export interface SandboxJoinResult {
+  state: "active" | "queued";
+  visit?: SandboxOccupant & { protocol?: string; started_at?: string | null } | null;
+  ticket?: SandboxTicket | null;
+  probe?: { ok: boolean; latency_ms: number; model: string };
+}
+
+export interface SandboxMe {
+  sandbox: boolean;
+  visit?: {
+    id: string;
+    nickname: string;
+    model_id: string;
+    protocol: string;
+    seconds_left: number;
+    expires_at?: string | null;
+  };
+  limits?: { max_projects: number; max_jobs: number; max_upload_mb: number };
 }

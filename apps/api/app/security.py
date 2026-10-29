@@ -4,9 +4,9 @@ import hashlib
 import re
 from pathlib import Path
 
-from cryptography.fernet import Fernet, InvalidToken
-
-from .config import settings
+# Credential sealing moved to ``app.auth`` because it now needs the owning user
+# id for AAD binding. Re-exported here so existing imports keep working.
+from .auth import decrypt_secret, encrypt_secret, fingerprint  # noqa: F401
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _CN_MOBILE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
@@ -49,34 +49,8 @@ def sha256_text(text: str) -> str:
     return sha256_bytes(text.encode("utf-8"))
 
 
-def _fernet() -> Fernet:
-    path: Path = settings.secret_key_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        path.write_bytes(Fernet.generate_key())
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
-    return Fernet(path.read_bytes().strip())
-
-
-def encrypt_secret(value: str) -> str:
-    if not value:
-        return ""
-    return _fernet().encrypt(value.encode("utf-8")).decode("ascii")
-
-
-def decrypt_secret(value: str) -> str:
-    if not value:
-        return ""
-    try:
-        return _fernet().decrypt(value.encode("ascii")).decode("utf-8")
-    except (InvalidToken, ValueError) as exc:
-        raise ValueError("无法解密 API Key，请重新保存模型配置") from exc
-
-
 def mask_secret(value: str) -> str:
+    """Human-readable placeholder. The plaintext key is never returned by the API."""
     if not value:
         return ""
     return "已配置 · " + ("*" * 8) + value[-4:]

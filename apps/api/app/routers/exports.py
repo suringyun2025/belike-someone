@@ -9,17 +9,18 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
-from ..models import Export, Project
+from ..deps import current_user, owned_project
+from ..models import Export, Project, User
 from ..schemas import ExportOut
 
 router = APIRouter(tags=["exports"])
 
 
 @router.get("/projects/{project_id}/exports", response_model=list[ExportOut])
-def list_exports(project_id: str, db: Session = Depends(get_db)):
-    project = db.get(Project, project_id)
-    if not project or project.deleted_at is not None:
-        raise HTTPException(status_code=404, detail="项目不存在")
+def list_exports(
+    project_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    owned_project(project_id, db, user)
     exports = db.scalars(
         select(Export).where(Export.project_id == project_id).order_by(Export.created_at.desc())
     ).all()
@@ -27,18 +28,24 @@ def list_exports(project_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/exports/{export_id}", response_model=ExportOut)
-def get_export(export_id: str, db: Session = Depends(get_db)):
+def get_export(
+    export_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
     export = db.get(Export, export_id)
     if not export:
         raise HTTPException(status_code=404, detail="导出不存在")
+    owned_project(export.project_id, db, user)
     return ExportOut.model_validate(export)
 
 
 @router.get("/exports/{export_id}/download")
-def download_export(export_id: str, db: Session = Depends(get_db)):
+def download_export(
+    export_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
     export = db.get(Export, export_id)
     if not export:
         raise HTTPException(status_code=404, detail="导出不存在")
+    owned_project(export.project_id, db, user)
     path = Path(export.path).resolve()
     root = settings.export_dir.resolve()
     if not path.is_relative_to(root) or not path.exists():

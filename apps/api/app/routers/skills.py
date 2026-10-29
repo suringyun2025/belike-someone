@@ -9,27 +9,52 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
+from ..deps import current_user, owned_project
 from ..judge import evaluate_cases
 from ..llm import LLMError, get_adapter
-from ..models import AuditEvent, EvalCase, EvalRun, Project, Provider, Skill, SkillVersion, utcnow
+from ..models import (
+    AuditEvent,
+    EvalCase,
+    EvalRun,
+    Project,
+    Provider,
+    Skill,
+    SkillVersion,
+    User,
+    utcnow,
+)
+from ..rate_limit import heavy_limiter
 from ..pipeline import validate_skill
 from ..schemas import EvalCaseOut, EvalRunOut, EvaluateRequest, SkillOut
 
 router = APIRouter(tags=["skills"])
 
 
-def _get_skill(db: Session, skill_id: str) -> Skill:
+def _get_skill(db: Session, skill_id: str, user: User) -> Skill:
+    """Resolve a skill and verify ownership through its project."""
     skill = db.get(Skill, skill_id)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill 不存在")
+    owned_project(skill.project_id, db, user)
     return skill
 
 
+def _get_provider(db: Session, provider_id: str, user: User) -> Provider | None:
+    provider = db.get(Provider, provider_id)
+    if not provider:
+        return None
+    from ..config import settings
+
+    if settings.multiuser and provider.owner_id != user.id:
+        return None
+    return provider
+
+
 @router.get("/projects/{project_id}/skills", response_model=list[SkillOut])
-def list_skills(project_id: str, db: Session = Depends(get_db)):
-    project = db.get(Project, project_id)
-    if not project or project.deleted_at is not None:
-        raise HTTPException(status_code=404, detail="项目不存在")
+def list_skills(
+    project_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    owned_project(project_id, db, user)
     skills = db.scalars(
         select(Skill).where(Skill.project_id == project_id).order_by(Skill.dimension, Skill.updated_at.desc())
     ).all()
@@ -37,13 +62,20 @@ def list_skills(project_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/skills/{skill_id}", response_model=SkillOut)
-def get_skill(skill_id: str, db: Session = Depends(get_db)):
-    return SkillOut.model_validate(_get_skill(db, skill_id))
+def get_skill(
+    skill_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    return SkillOut.model_validate(_get_skill(db, skill_id, user))
 
 
 @router.get("/skills/{skill_id}/files/{file_path:path}", response_class=PlainTextResponse)
-def get_skill_file(skill_id: str, file_path: str, db: Session = Depends(get_db)):
-    skill = _get_skill(db, skill_id)
+def get_skill_file(
+    skill_id: str,
+    file_path: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    skill = _get_skill(db, skill_id, user)
     files = skill.files or {}
     if file_path not in files:
         raise HTTPException(status_code=404, detail="文件不存在")
@@ -51,8 +83,10 @@ def get_skill_file(skill_id: str, file_path: str, db: Session = Depends(get_db))
 
 
 @router.post("/skills/{skill_id}/validate")
-def validate_skill_endpoint(skill_id: str, db: Session = Depends(get_db)):
-    skill = _get_skill(db, skill_id)
+def validate_skill_endpoint(
+    skill_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    skill = _get_skill(db, skill_id, user)
     report = validate_skill(skill)
     skill.validation = {**(skill.validation or {}), "static": report}
     skill.status = "validated" if report["ok"] else "failed"
@@ -73,17 +107,27 @@ def evaluate_skill(
     skill_id: str,
     payload: EvaluateRequest | None = None,
     db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
-    skill = _get_skill(db, skill_id)
+    skill = _get_skill(db, skill_id, user)
     project = db.get(Project, skill.project_id)
     request = payload or EvaluateRequest()
+    allowed, retry = heavy_limiter.take(f"eval:{user.id}")
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"评测请求过于频繁，请 {int(retry)} 秒后重试",
+            headers={"Retry-After": str(int(retry) + 1)},
+        )
+    # Provider lookups are owner-scoped: passing someone else's provider id must
+    # not trigger a paid request against their account.
     generator_provider = (
-        db.get(Provider, request.provider_id)
+        _get_provider(db, request.provider_id, user)
         if request.provider_id
-        else (db.get(Provider, project.provider_id) if project and project.provider_id else None)
+        else (_get_provider(db, project.provider_id, user) if project and project.provider_id else None)
     )
     judge_provider = (
-        db.get(Provider, request.judge_provider_id)
+        _get_provider(db, request.judge_provider_id, user)
         if request.judge_provider_id
         else generator_provider
     )
@@ -93,8 +137,8 @@ def evaluate_skill(
             detail="LLM-as-judge 需要生成模型与评审模型；请先配置 Provider 并选择模型",
         )
     try:
-        generator = get_adapter(generator_provider)
-        judge = get_adapter(judge_provider)
+        generator = get_adapter(generator_provider, owner_id=user.id)
+        judge = get_adapter(judge_provider, owner_id=user.id)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"模型配置不可用：{exc}") from exc
 
@@ -183,7 +227,10 @@ def evaluate_skill(
 
 
 @router.get("/projects/{project_id}/eval-cases", response_model=list[EvalCaseOut])
-def list_eval_cases(project_id: str, db: Session = Depends(get_db)):
+def list_eval_cases(
+    project_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    owned_project(project_id, db, user)
     cases = db.scalars(
         select(EvalCase).where(EvalCase.project_id == project_id).order_by(EvalCase.created_at.desc())
     ).all()
@@ -191,7 +238,10 @@ def list_eval_cases(project_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/projects/{project_id}/eval-runs", response_model=list[EvalRunOut])
-def list_eval_runs(project_id: str, db: Session = Depends(get_db)):
+def list_eval_runs(
+    project_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    owned_project(project_id, db, user)
     runs = db.scalars(
         select(EvalRun).where(EvalRun.project_id == project_id).order_by(EvalRun.created_at.desc())
     ).all()
@@ -199,10 +249,13 @@ def list_eval_runs(project_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/eval-runs/{run_id}", response_model=EvalRunOut)
-def get_eval_run(run_id: str, db: Session = Depends(get_db)):
+def get_eval_run(
+    run_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
     run = db.get(EvalRun, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="评测运行不存在")
+    owned_project(run.project_id, db, user)
     return EvalRunOut.model_validate(run)
 
 
@@ -210,8 +263,10 @@ def get_eval_run(run_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/skills/{skill_id}/versions")
-def list_skill_versions(skill_id: str, db: Session = Depends(get_db)):
-    skill = _get_skill(db, skill_id)
+def list_skill_versions(
+    skill_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)
+):
+    skill = _get_skill(db, skill_id, user)
     versions = db.scalars(
         select(SkillVersion)
         .where(SkillVersion.skill_id == skill.id)

@@ -143,9 +143,13 @@ def _base_headers(key: str) -> dict[str, str]:
 class BaseAdapter:
     protocol = "base"
 
-    def __init__(self, provider: Provider) -> None:
+    def __init__(self, provider: Provider, owner_id: str = "") -> None:
         self.provider = provider
-        self.api_key = decrypt_secret(provider.api_key_encrypted)
+        # The owner id is required to unseal keys written by the multiuser build.
+        # Leaving it empty still works for legacy single-user rows.
+        self.api_key = decrypt_secret(
+            provider.api_key_encrypted, owner_id or (provider.owner_id or "")
+        )
         self.params: dict[str, Any] = provider.params or {}
 
     def _headers(self) -> dict[str, str]:
@@ -608,11 +612,11 @@ ADAPTERS: dict[str, type[BaseAdapter]] = {
 }
 
 
-def get_adapter(provider: Provider) -> BaseAdapter:
+def get_adapter(provider: Provider, owner_id: str = "") -> BaseAdapter:
     adapter_cls = ADAPTERS.get(provider.protocol)
     if not adapter_cls:
         raise LLMError("INVALID_REQUEST", f"未知协议：{provider.protocol}")
-    return adapter_cls(provider)
+    return adapter_cls(provider, owner_id=owner_id)
 
 
 def capabilities_for(protocol: str) -> dict[str, Any]:

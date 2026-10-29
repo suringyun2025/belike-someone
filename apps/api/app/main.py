@@ -16,13 +16,16 @@ from .config import ROOT_DIR, settings
 from .db import healthcheck, init_db
 from .errors import install_error_handlers
 from .logging_setup import configure_logging
+from .rate_limit import api_limiter
 from .routers import (
+    auth,
     claims,
     dashboard,
     exports,
     jobs,
     projects,
     providers,
+    sandbox as sandbox_router,
     search,
     settings as settings_router,
     skills,
@@ -62,21 +65,43 @@ async def lifespan(_app: FastAPI):
     init_db()
     stop_event = threading.Event()
     thread = None
+    reaper = None
     if settings.inline_worker:
         thread = threading.Thread(
             target=worker_loop, args=(stop_event,), daemon=True, name="distill-worker"
         )
         thread.start()
         logger.info("inline worker started as %s", settings.worker_id)
+    if settings.sandbox:
+        # Free the seat at boot: a restart kills in-flight work, and leaving the
+        # old visit "active" would lock the demo out until its timer drained.
+        from .db import SessionLocal
+        from .sandbox import recover_on_startup, reaper_loop
+
+        db = SessionLocal()
+        try:
+            recover_on_startup(db)
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("sandbox recovery skipped: %s", exc)
+        finally:
+            db.close()
+        reaper = threading.Thread(
+            target=reaper_loop, args=(stop_event,), daemon=True, name="sandbox-reaper"
+        )
+        reaper.start()
+        logger.info(
+            "sandbox mode: one seat, %s min per visit", settings.sandbox_visit_minutes
+        )
     _app.state.started_at = time.time()
     try:
         yield
     finally:
         stop_event.set()
-        if thread:
-            # Give an in-flight stage a chance to finish its transaction instead
-            # of killing the process mid-commit.
-            thread.join(timeout=15)
+        for worker_thread in (thread, reaper):
+            if worker_thread:
+                # Give an in-flight stage a chance to finish its transaction
+                # instead of killing the process mid-commit.
+                worker_thread.join(timeout=15)
         logger.info("shutdown complete")
 
 
@@ -122,7 +147,58 @@ async def request_context(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Attach browser-side hardening headers to every response."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Permissions-Policy", "geolocation=(), microphone=(), camera=(), interest-cohort=()"
+    )
+    # The SPA needs inline styles from Tailwind's runtime and its own bundle; no
+    # third-party script origins are required, so keep the policy tight.
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+        "base-uri 'self'; form-action 'self'",
+    )
+    if settings.is_production:
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+    return response
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Coarse per-identity throttle.
+
+    Auth endpoints keep their own stricter buckets, so they are excluded here to
+    avoid double counting a single failed login as two requests.
+    """
+    path = request.url.path
+    if settings.multiuser and path.startswith(settings.api_prefix) and not path.startswith(
+        f"{settings.api_prefix}/health"
+    ) and not path.startswith(f"{settings.api_prefix}/ready") and "/auth/" not in path:
+        from .deps import SESSION_COOKIE, client_ip
+
+        identity = request.cookies.get(SESSION_COOKIE, "")[:24] or client_ip(request)
+        allowed, retry = api_limiter.take(f"api:{identity}")
+        if not allowed:
+            return JSONResponse(
+                {"detail": "请求过于频繁，请稍后重试"},
+                status_code=429,
+                headers={"Retry-After": str(int(retry) + 1)},
+            )
+    return await call_next(request)
+
+
 for router in (
+    auth.router,
+    sandbox_router.router,
     projects.router,
     sources.router,
     providers.router,

@@ -25,6 +25,7 @@ dependencies = [
   "sqlite-vec>=0.1.9,<1",
   "fastembed>=0.9,<1",
   "alembic>=1.14,<2",
+  "argon2-cffi>=23,<26",
 ]
 
 [project.optional-dependencies]

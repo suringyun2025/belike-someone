@@ -226,7 +226,11 @@ export function PipelineTab({ project, providers, setTab }: ProjectTabProps) {
                     <StatusBadge status={item.status} />
                   </div>
                   <div className="mt-2 flex items-center justify-between text-[10px] text-muted">
-                    <span>{stageLabels[item.current_stage] || item.current_stage || "等待开始"}</span>
+                    <span>
+                      {item.status === "queued" && item.queue_position
+                        ? `排队第 ${item.queue_position} 位`
+                        : stageLabels[item.current_stage] || item.current_stage || "等待开始"}
+                    </span>
                     <span>{relativeTime(item.created_at)}</span>
                   </div>
                   <Progress className="mt-2" value={item.progress} tone={item.status === "failed" ? "danger" : item.status === "completed" ? "success" : "primary"} />
@@ -299,6 +303,15 @@ export function PipelineTab({ project, providers, setTab }: ProjectTabProps) {
                 </div>
 
                 {job.error ? <Alert tone="danger" title="任务失败">{job.error}</Alert> : null}
+                {job.status === "queued" ? (
+                  <Alert tone="info" title={`排队中${job.queue_position ? ` · 第 ${job.queue_position} 位` : ""}`}>
+                    {job.queue_reason || "服务器并发已满，任务会在有空闲槽位时自动开始。"}
+                    {job.queue_ahead > 0 ? ` 前面还有 ${job.queue_ahead} 个任务。` : ""}
+                    <span className="mt-1 block opacity-80">
+                      为保证小服务器的稳定性，同时运行的任务数受限；排队不会丢失任务。
+                    </span>
+                  </Alert>
+                ) : null}
                 {job.status === "waiting_for_review" ? (
                   <Alert tone="warning" title="等待人工审核">
                     蒸馏已完成。请在审核收件箱批准或驳回断言，然后回到这里运行编译任务。

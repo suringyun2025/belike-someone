@@ -114,7 +114,25 @@ def provider_out(provider: Provider) -> ProviderOut:
     )
 
 
-def job_out(job: Job) -> JobOut:
+def job_out(job: Job, db: Session | None = None) -> JobOut:
+    """Serialise a job, including queue position when it is still waiting.
+
+    ``db`` is optional so existing callers keep working; without it the queue
+    fields stay zero.
+    """
+    queue_position = 0
+    queue_ahead = 0
+    queue_reason = ""
+    if db is not None and job.status == "queued":
+        try:
+            from ..worker import queue_position as _queue_position
+
+            info = _queue_position(db, job)
+            queue_position = info["position"]
+            queue_ahead = info["ahead"]
+            queue_reason = info["reason"]
+        except Exception:
+            pass
     stages = [
         StageOut(
             id=stage.id,
@@ -146,6 +164,9 @@ def job_out(job: Job) -> JobOut:
         finished_at=job.finished_at,
         worker_id=job.worker_id or "",
         usage=job.usage or {},
+        queue_position=queue_position,
+        queue_ahead=queue_ahead,
+        queue_reason=queue_reason,
         stages=stages,
     )
 

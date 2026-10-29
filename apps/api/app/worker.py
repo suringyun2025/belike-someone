@@ -1,23 +1,47 @@
+"""Concurrency-bounded job scheduler.
+
+Why this exists
+---------------
+A single `while: claim(); run_job()` loop processes exactly one job at a time.
+Raising the worker count is not enough either: the deployment target is a 2 vCPU
+/ 2 GB host, and a distillation stage holds parsed text plus an ONNX embedding
+model in memory. Two concurrent jobs there can push the box into swap, which is
+slower than running them one after another.
+
+So the scheduler enforces three limits at once:
+
+1. **Global concurrency** (`max_concurrent_jobs`) — the hard cap the server can
+   actually sustain. Extras wait in the queue, they are not rejected.
+2. **Per-user concurrency** (`max_jobs_per_user`) — one account cannot occupy
+   every slot, so a second user still makes progress.
+3. **Memory headroom** (`min_free_mb`) — before claiming, check available RAM;
+   if a new job would drop the host below the floor, wait. This turns "the box
+   died at 3am" into "the job started a minute later".
+
+Ordering is FIFO by `created_at`, so waiting is fair. Nothing is silently
+dropped: a queued job keeps `status='queued'` and the API exposes its position.
+"""
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
-from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from .config import settings
 from .db import SessionLocal
-from .models import Job, StageRun, utcnow
+from .models import Job, Project, StageRun, utcnow
 from .pipeline import run_job
 
 logger = logging.getLogger("distill.worker")
 
+ACTIVE_STATUSES = ("running",)
 
-@dataclass(frozen=True)
+
 class Lease:
     """Ownership token for a claimed job.
 
@@ -26,92 +50,190 @@ class Lease:
     over. Every state write must be conditioned on the current epoch.
     """
 
-    job_id: str
-    worker_id: str
-    epoch: int
+    __slots__ = ("job_id", "worker_id", "epoch", "owner_id")
+
+    def __init__(self, job_id: str, worker_id: str, epoch: int, owner_id: str | None = None) -> None:
+        self.job_id = job_id
+        self.worker_id = worker_id
+        self.epoch = epoch
+        self.owner_id = owner_id
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"Lease({self.job_id}, epoch={self.epoch})"
 
 
-def recover_interrupted_jobs() -> int:
-    """Return jobs whose owning worker died back to the queue.
-
-    Only jobs with an expired lease are reclaimed, so a healthy worker in
-    another replica is never stolen from. The epoch is bumped here as well, which
-    invalidates any late write from the dead worker.
-    """
-    db = SessionLocal()
+# --------------------------------------------------------------------------- #
+# Resource awareness
+# --------------------------------------------------------------------------- #
+def available_memory_mb() -> int | None:
+    """Return free memory in MiB, or None when it cannot be determined."""
     try:
-        now = utcnow()
-        stale = db.execute(
-            update(Job)
-            .where(
-                (Job.status == "running")
-                & ((Job.lease_expires_at.is_(None)) | (Job.lease_expires_at < now))
-            )
-            .values(
-                status="queued",
-                error="",
-                worker_id="",
-                lease_expires_at=None,
-                lease_epoch=Job.lease_epoch + 1,
-            )
-        )
-        db.execute(
-            update(StageRun).where(StageRun.status == "running").values(status="pending")
-        )
-        db.commit()
-        count = stale.rowcount or 0
-        if count:
-            logger.warning("recovered %s job(s) with expired lease", count)
-        return count
-    finally:
-        db.close()
+        import psutil  # optional dependency
+
+        return int(psutil.virtual_memory().available / (1024 * 1024))
+    except Exception:
+        pass
+    try:
+        if os.path.exists("/proc/meminfo"):
+            with open("/proc/meminfo", encoding="ascii") as handle:
+                for line in handle:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return None
+
+
+def memory_ok() -> tuple[bool, str]:
+    """Check the memory floor before admitting a new job."""
+    free = available_memory_mb()
+    if free is None:
+        return True, ""
+    floor = settings.min_free_mb
+    if free < floor:
+        return False, f"可用内存 {free} MB 低于保留下限 {floor} MB"
+    return True, ""
+
+
+# --------------------------------------------------------------------------- #
+# Admission control
+# --------------------------------------------------------------------------- #
+def active_jobs(db) -> int:
+    return db.scalar(
+        select(func.count()).select_from(Job).where(Job.status.in_(ACTIVE_STATUSES))
+    ) or 0
+
+
+def active_jobs_for(db, owner_id: str | None) -> int:
+    if not owner_id:
+        return 0
+    return db.scalar(
+        select(func.count())
+        .select_from(Job)
+        .join(Project, Project.id == Job.project_id)
+        .where(Job.status.in_(ACTIVE_STATUSES), Project.owner_id == owner_id)
+    ) or 0
+
+
+def _next_candidate(db) -> str | None:
+    """Oldest queued job whose owner still has capacity.
+
+    Per-user capacity is evaluated in Python because the limit depends on
+    settings, not a column. The scan is bounded: with a handful of concurrent
+    users, checking the first few dozen rows is enough to find a runnable job and
+    avoids an unbounded walk if one user has queued hundreds.
+    """
+    rows = db.execute(
+        select(Job.id, Project.owner_id)
+        .join(Project, Project.id == Job.project_id)
+        .where(Job.status == "queued", Project.deleted_at.is_(None))
+        .order_by(Job.created_at)
+        .limit(50)
+    ).all()
+    per_user: dict[str | None, int] = {}
+    for _job_id, owner_id in rows:
+        if owner_id not in per_user:
+            per_user[owner_id] = active_jobs_for(db, owner_id)
+        if per_user[owner_id] < settings.max_jobs_per_user:
+            return _job_id
+        # Already saturated: keep looking at the next owner.
+    return None
+
+
+def queue_position(db, job) -> dict:
+    """Describe where a queued job sits and what it is waiting for.
+
+    Surfaced by the API so the UI can say "queued: 2 jobs ahead, waiting for a
+    free slot" instead of showing an indefinite spinner.
+    """
+    if job.status != "queued":
+        return {"position": 0, "ahead": 0, "reason": ""}
+
+    ahead = db.scalar(
+        select(func.count())
+        .select_from(Job)
+        .where(Job.status == "queued", Job.created_at < job.created_at)
+    ) or 0
+    running = active_jobs(db)
+    owner_running = active_jobs_for(db, job.owner_id)
+    reason = ""
+    if runnable_slots(db) <= 0:
+        reason = f"服务器并发已满（{running}/{settings.max_concurrent_jobs}），排队等待"
+    elif owner_running >= settings.max_jobs_per_user:
+        reason = f"你的并发任务已达上限（{owner_running}/{settings.max_jobs_per_user}）"
+    ok, why = memory_ok()
+    if not ok:
+        reason = f"服务器内存紧张，稍后自动开始（{why}）"
+    return {"position": ahead + 1, "ahead": ahead, "reason": reason}
+
+
+def runnable_slots(db) -> int:
+    """How many more jobs may start right now."""
+    return max(0, settings.max_concurrent_jobs - active_jobs(db))
 
 
 def claim_job() -> Lease | None:
-    """Atomically claim one queued job.
+    """Atomically claim one queued job that is allowed to start.
 
-    The conditional ``UPDATE ... WHERE status='queued'`` is the atomicity
-    primitive: two workers racing on the same row produce exactly one
-    ``rowcount == 1``. This works on SQLite (single writer) and PostgreSQL
-    (row lock) without depending on ``FOR UPDATE SKIP LOCKED`` or on
-    ``RETURNING`` support, which older SQLite builds lack.
-
-    The epoch is incremented inside the same statement, so no window exists in
-    which a job is running under an epoch another worker could reuse.
+    Admission control happens *before* the claim so a rejected job is never
+    flipped to `running` and then abandoned. The claim itself stays a conditional
+    UPDATE, which is what makes two schedulers safe on the same database.
     """
+    if settings.max_concurrent_jobs <= 0:
+        return None
+    ok, why = memory_ok()
+    if not ok:
+        logger.debug("admission deferred: %s", why)
+        return None
+
     db = SessionLocal()
     try:
+        if active_jobs(db) >= settings.max_concurrent_jobs:
+            return None
+        job_id = _next_candidate(db)
+        if not job_id:
+            return None
+
         now = utcnow()
         lease_until = now + timedelta(seconds=settings.worker_lease_seconds)
-        candidates = db.scalars(
-            select(Job.id).where(Job.status == "queued").order_by(Job.created_at).limit(5)
-        ).all()
-        for job_id in candidates:
-            try:
-                result = db.execute(
-                    update(Job)
-                    .where((Job.id == job_id) & (Job.status == "queued"))
-                    .values(
-                        status="running",
-                        worker_id=settings.worker_id,
-                        lease_expires_at=lease_until,
-                        lease_epoch=Job.lease_epoch + 1,
-                        # Preserve the original start time across retries.
-                        started_at=func.coalesce(Job.started_at, now),
-                        error="",
-                    )
+        try:
+            result = db.execute(
+                update(Job)
+                .where((Job.id == job_id) & (Job.status == "queued"))
+                .values(
+                    status="running",
+                    worker_id=settings.worker_id,
+                    lease_expires_at=lease_until,
+                    lease_epoch=Job.lease_epoch + 1,
+                    started_at=func.coalesce(Job.started_at, now),
+                    error="",
                 )
-            except OperationalError as exc:  # pragma: no cover - write contention
-                db.rollback()
-                logger.debug("claim contention on %s: %s", job_id, exc)
-                continue
-            if result.rowcount == 1:
-                epoch = db.scalar(select(Job.lease_epoch).where(Job.id == job_id)) or 0
-                db.commit()
-                logger.info("claimed job %s (epoch %s)", job_id, epoch)
-                return Lease(job_id=job_id, worker_id=settings.worker_id, epoch=int(epoch))
+            )
+        except OperationalError as exc:  # pragma: no cover - write contention
             db.rollback()
-        return None
+            logger.debug("claim contention on %s: %s", job_id, exc)
+            return None
+
+        if result.rowcount != 1:
+            db.rollback()
+            return None
+
+        row = db.execute(
+            select(Job.lease_epoch, Project.owner_id)
+            .join(Project, Project.id == Job.project_id)
+            .where(Job.id == job_id)
+        ).first()
+        db.commit()
+        epoch = int(row[0]) if row else 0
+        owner_id = row[1] if row else None
+        logger.info(
+            "claimed job %s (epoch %s, active=%s/%s)",
+            job_id,
+            epoch,
+            active_jobs(db),
+            settings.max_concurrent_jobs,
+        )
+        return Lease(job_id=job_id, worker_id=settings.worker_id, epoch=epoch, owner_id=owner_id)
     except IntegrityError:  # pragma: no cover - concurrent claim race
         db.rollback()
         return None
@@ -119,12 +241,11 @@ def claim_job() -> Lease | None:
         db.close()
 
 
+# --------------------------------------------------------------------------- #
+# Lease maintenance
+# --------------------------------------------------------------------------- #
 def renew_lease(lease: Lease) -> bool:
-    """Extend the lease. Returns False when ownership was lost.
-
-    A False result means another worker reclaimed the job, so the caller must
-    stop writing immediately instead of finishing with stale data.
-    """
+    """Extend the lease. False means ownership was lost — stop writing."""
     db = SessionLocal()
     try:
         result = db.execute(
@@ -135,9 +256,7 @@ def renew_lease(lease: Lease) -> bool:
                 & (Job.lease_epoch == lease.epoch)
                 & (Job.status == "running")
             )
-            .values(
-                lease_expires_at=utcnow() + timedelta(seconds=settings.worker_lease_seconds)
-            )
+            .values(lease_expires_at=utcnow() + timedelta(seconds=settings.worker_lease_seconds))
         )
         db.commit()
         return (result.rowcount or 0) == 1
@@ -159,7 +278,6 @@ def release_lease(lease: Lease) -> None:
 
 
 def owns(lease: Lease) -> bool:
-    """Check whether this worker still owns the job."""
     db = SessionLocal()
     try:
         row = db.scalar(
@@ -174,13 +292,40 @@ def owns(lease: Lease) -> bool:
         db.close()
 
 
-class Heartbeat:
-    """Background lease renewal for long provider calls.
+def recover_interrupted_jobs() -> int:
+    """Return jobs whose owner died back to the queue.
 
-    Renewing only between stages is not enough: a single extraction stage can run
-    for minutes. A daemon thread keeps the lease alive and flips ``lost`` when
-    ownership disappears.
+    Only expired leases are reclaimed, so a healthy worker is never stolen from.
     """
+    db = SessionLocal()
+    try:
+        now = utcnow()
+        stale = db.execute(
+            update(Job)
+            .where(
+                (Job.status == "running")
+                & ((Job.lease_expires_at.is_(None)) | (Job.lease_expires_at < now))
+            )
+            .values(
+                status="queued",
+                error="",
+                worker_id="",
+                lease_expires_at=None,
+                lease_epoch=Job.lease_epoch + 1,
+            )
+        )
+        db.execute(update(StageRun).where(StageRun.status == "running").values(status="pending"))
+        db.commit()
+        count = stale.rowcount or 0
+        if count:
+            logger.warning("recovered %s job(s) with expired lease", count)
+        return count
+    finally:
+        db.close()
+
+
+class Heartbeat:
+    """Background lease renewal for long provider calls."""
 
     def __init__(self, lease: Lease, interval: float | None = None) -> None:
         self.lease = lease
@@ -214,41 +359,107 @@ class Heartbeat:
             self._thread.join(timeout=2)
 
 
-def run_once() -> bool:
-    """Claim and execute a single job. Returns True when work was done."""
-    lease = claim_job()
-    if not lease:
-        return False
+# --------------------------------------------------------------------------- #
+# Execution
+# --------------------------------------------------------------------------- #
+def execute_lease(lease: Lease) -> None:
+    """Run one claimed job to completion, then release its slot."""
     try:
         with Heartbeat(lease):
             run_job(lease.job_id, lease=lease, owns=lambda: owns(lease))
-    except Exception as exc:  # pragma: no cover - never kill the loop
+    except Exception as exc:  # pragma: no cover - never kill the scheduler
         logger.exception("job %s crashed: %s", lease.job_id, exc)
+        # Mark it failed so the slot is not held by a zombie row.
+        db = SessionLocal()
+        try:
+            job = db.get(Job, lease.job_id)
+            if job and job.status == "running":
+                job.status = "failed"
+                job.error = f"任务执行异常：{str(exc)[:500]}"
+                job.finished_at = utcnow()
+                job.lease_expires_at = None
+                db.add(job)
+                db.commit()
+        finally:
+            db.close()
     finally:
         try:
             release_lease(lease)
         except Exception:
             pass
+
+
+def run_once() -> bool:
+    """Claim and execute a single job synchronously. Returns True if work ran."""
+    lease = claim_job()
+    if not lease:
+        return False
+    execute_lease(lease)
     return True
 
 
+def _supervise(active: dict[str, threading.Thread], lease: Lease, stop_event: threading.Event) -> None:
+    def _target() -> None:
+        try:
+            execute_lease(lease)
+        finally:
+            active.pop(lease.job_id, None)
+
+    thread = threading.Thread(target=_target, daemon=True, name=f"job-{lease.job_id}")
+    active[lease.job_id] = thread
+    thread.start()
+
+
 def worker_loop(stop_event: threading.Event) -> None:
-    logger.info("worker %s started", settings.worker_id)
+    """Concurrency-bounded scheduler.
+
+    Starts up to ``max_concurrent_jobs`` jobs in parallel threads and keeps
+    refilling freed slots. Jobs beyond the cap stay queued rather than being
+    rejected, which is what makes the behaviour "queue and wait" rather than
+    "fail fast".
+    """
+    logger.info(
+        "scheduler %s started (max_concurrent=%s, per_user=%s, lease=%ss, mem_floor=%sMB)",
+        settings.worker_id,
+        settings.max_concurrent_jobs,
+        settings.max_jobs_per_user,
+        settings.worker_lease_seconds,
+        settings.min_free_mb,
+    )
     try:
         recover_interrupted_jobs()
     except Exception as exc:  # pragma: no cover - startup resilience
         logger.warning("job recovery failed: %s", exc)
+
+    active: dict[str, threading.Thread] = {}
     while not stop_event.is_set():
-        try:
-            worked = run_once()
-        except Exception as exc:  # pragma: no cover - keep the loop alive
-            logger.exception("worker iteration failed: %s", exc)
-            worked = False
-        if not worked:
+        # Reap finished threads so slots free up promptly.
+        for job_id, thread in list(active.items()):
+            if not thread.is_alive():
+                active.pop(job_id, None)
+
+        claimed_any = False
+        while len(active) < settings.max_concurrent_jobs and not stop_event.is_set():
+            lease = claim_job()
+            if not lease:
+                break
+            _supervise(active, lease, stop_event)
+            claimed_any = True
+
+        if not claimed_any and not active:
             stop_event.wait(settings.worker_poll_seconds)
         else:
-            time.sleep(0.05)
-    logger.info("worker %s stopped", settings.worker_id)
+            # Still poll while jobs run, cheaper than being woken per completion.
+            stop_event.wait(min(settings.worker_poll_seconds, 1.0))
+
+    # Graceful shutdown: let in-flight jobs finish rather than orphaning leases.
+    if active:
+        logger.info("waiting for %s in-flight job(s) to finish", len(active))
+        deadline = time.time() + 30
+        for thread in list(active.values()):
+            remaining = max(0.1, deadline - time.time())
+            thread.join(timeout=remaining)
+    logger.info("scheduler %s stopped", settings.worker_id)
 
 
 def main() -> None:

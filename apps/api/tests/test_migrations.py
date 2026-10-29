@@ -16,7 +16,7 @@ from sqlalchemy import create_engine, inspect, text
 
 API_DIR = Path(__file__).resolve().parents[1]
 BASELINE = "0001_baseline"
-HEAD = "0002_lease_and_versions"
+HEAD = "0004_sandbox"
 
 
 def _config(db_path: Path) -> Config:

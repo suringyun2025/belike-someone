@@ -4,6 +4,7 @@ import {
   Activity,
   Boxes,
   ChevronRight,
+  Clock,
   FolderKanban,
   LayoutDashboard,
   Menu,
@@ -16,6 +17,10 @@ import {
 } from "lucide-react";
 import { cn } from "./ui";
 import { useTheme } from "./lib/hooks";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { api } from "./api";
+import type { AuthUser } from "./types";
+import { LogOut } from "lucide-react";
 
 const navigation = [
   { to: "/", label: "仪表盘", icon: LayoutDashboard, end: true },
@@ -37,6 +42,25 @@ function breadcrumb(pathname: string) {
 export function Layout() {
   const location = useLocation();
   const { dark, toggle } = useTheme();
+  const queryClient = useQueryClient();
+  // The account block only makes sense when there is a real login. The server
+  // tells us which mode it is in; single-user builds hide the block entirely.
+  const authConfig = useQuery({
+    queryKey: ["auth-config"],
+    queryFn: api.authConfig,
+    staleTime: 60_000,
+    retry: false,
+  });
+  const isMultiuser = Boolean(authConfig.data?.multiuser);
+  const isSandbox = Boolean(authConfig.data?.sandbox);
+  const me = useQuery<AuthUser>({
+    queryKey: ["me"],
+    queryFn: api.me,
+    retry: false,
+    staleTime: 60_000,
+    enabled: isMultiuser,
+  });
+  const account = isMultiuser ? me.data : undefined;
   const crumbs = breadcrumb(location.pathname);
   // 窄屏时侧边栏改为抽屉；桌面保持常驻，避免多一次点击。
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -107,6 +131,29 @@ export function Layout() {
       </nav>
 
       <div className="border-t border-border px-3 py-3">
+        {isSandbox ? <SandboxPanel /> : null}
+        {account && !isSandbox ? (
+          <div className="mb-2 rounded-xl border bg-elevated/60 px-3 py-2">
+            <p className="truncate text-[11px] font-medium" title={account.email}>
+              {account.display_name || account.email}
+            </p>
+            <p className="truncate text-[10px] text-muted">
+              {account.project_count}/{account.max_projects} 个项目
+            </p>
+            <button
+              type="button"
+              className="mt-1.5 flex items-center gap-1 text-[10px] text-muted transition hover:text-danger"
+              onClick={async () => {
+                await api.logout().catch(() => undefined);
+                queryClient.clear();
+                window.location.reload();
+              }}
+            >
+              <LogOut className="h-3 w-3" />
+              退出登录
+            </button>
+          </div>
+        ) : null}
         <button type="button" onClick={toggle} className="nav-link w-full justify-between">
           <span className="flex items-center gap-3">
             {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
@@ -199,6 +246,107 @@ export function Layout() {
           <Outlet />
         </main>
       </div>
+    </div>
+  );
+}
+/**
+ * Sidebar block for a demo visit: a live countdown and a one-click exit.
+ *
+ * The countdown matters because the seat is time-boxed and someone is waiting
+ * behind it; a visitor who cannot see the clock either wastes their own turn or
+ * gets cut off mid-review. The exit button is deliberately explicit about
+ * deleting data, since that is what it does.
+ */
+function SandboxPanel() {
+  const queryClient = useQueryClient();
+  const [confirming, setConfirming] = useState(false);
+  const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
+
+  const me = useQuery({
+    queryKey: ["sandbox-me"],
+    queryFn: api.sandboxMe,
+    staleTime: 30_000,
+    retry: 0,
+    refetchInterval: 60_000,
+  });
+
+  useEffect(() => {
+    if (me.data?.visit?.seconds_left != null) {
+      setSecondsLeft(me.data.visit.seconds_left);
+    }
+  }, [me.data]);
+
+  // Tick locally between polls; the server value is the authority and resets it.
+  useEffect(() => {
+    if (secondsLeft == null) return;
+    const timer = window.setInterval(() => {
+      setSecondsLeft((value) => (value == null ? null : Math.max(0, value - 1)));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [secondsLeft == null]);
+
+  if (!me.data?.sandbox || !me.data.visit) return null;
+
+  const minutes = secondsLeft == null ? null : Math.floor(secondsLeft / 60);
+  const seconds = secondsLeft == null ? 0 : secondsLeft % 60;
+  const urgent = secondsLeft != null && secondsLeft <= 300;
+
+  return (
+    <div className="mb-2 rounded-xl border bg-elevated/60 px-3 py-2">
+      <div className="flex items-center justify-between">
+        <span className="flex items-center gap-1 text-[10px] font-medium text-muted">
+          <Clock className="h-3 w-3" />
+          体验剩余
+        </span>
+        <span
+          className={cn(
+            "font-mono text-xs font-medium tabular-nums",
+            urgent ? "text-danger" : "text-fg",
+          )}
+        >
+          {minutes == null ? "--:--" : `${minutes}:${String(seconds).padStart(2, "0")}`}
+        </span>
+      </div>
+      <p className="mt-1 truncate text-[10px] text-muted" title={me.data.visit.model_id}>
+        {me.data.visit.nickname || "访客"} · {me.data.visit.model_id}
+      </p>
+
+      {confirming ? (
+        <div className="mt-2 rounded-lg border border-danger/30 bg-danger/5 p-2">
+          <p className="text-[10px] leading-4 text-danger">
+            结束会立即删除本次所有资料与 Key，无法恢复。确定？
+          </p>
+          <div className="mt-1.5 flex gap-2">
+            <button
+              type="button"
+              className="flex-1 rounded-md bg-danger px-2 py-1 text-[10px] font-medium text-white"
+              onClick={async () => {
+                await api.sandboxExit().catch(() => undefined);
+                queryClient.clear();
+                window.location.href = "/";
+              }}
+            >
+              结束并删除
+            </button>
+            <button
+              type="button"
+              className="flex-1 rounded-md border px-2 py-1 text-[10px]"
+              onClick={() => setConfirming(false)}
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          type="button"
+          className="mt-1.5 flex items-center gap-1 text-[10px] text-muted transition hover:text-danger"
+          onClick={() => setConfirming(true)}
+        >
+          <LogOut className="h-3 w-3" />
+          结束体验，让给下一位
+        </button>
+      )}
     </div>
   );
 }

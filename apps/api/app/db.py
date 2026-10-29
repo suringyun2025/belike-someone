@@ -76,6 +76,91 @@ def init_db() -> None:
         ensure_vector_schema()
     except Exception as exc:  # pragma: no cover - optional extension
         logger.warning("vector schema unavailable: %s", exc)
+    try:
+        bootstrap_admin()
+    except Exception as exc:  # pragma: no cover - never block startup
+        logger.warning("admin bootstrap skipped: %s", exc)
+
+
+def bootstrap_admin() -> None:
+    """Ensure a usable admin exists on a fresh multiuser deployment.
+
+    Without this, a public instance has no accounts and registration may be
+    disabled, leaving an unreachable login page. Credentials come from env vars;
+    the generated password is logged exactly once so the operator can sign in
+    and change it.
+    """
+    from sqlalchemy import func, select
+
+    from .models import Project, User
+
+    # A sandbox instance has no accounts to administer: the seat owns everything,
+    # and a leftover admin would be one more thing to purge.
+    if not settings.multiuser or settings.sandbox:
+        return
+    db = SessionLocal()
+    try:
+        existing = db.scalar(select(func.count()).select_from(User)) or 0
+        if existing:
+            # Claim any legacy rows that were left unowned before an admin existed.
+            admin = db.scalar(select(User).where(User.is_admin.is_(True)))
+            if admin:
+                claimed = 0
+                for project in db.scalars(select(Project).where(Project.owner_id.is_(None))).all():
+                    project.owner_id = admin.id
+                    db.add(project)
+                    claimed += 1
+                if claimed:
+                    db.commit()
+                    logger.info("claimed %s legacy project(s) for %s", claimed, admin.email)
+            return
+
+        from .auth import hash_password, validate_password_strength
+
+        email = (settings.admin_email or "admin@localhost").strip().lower()
+        password = settings.admin_password
+        generated = False
+        if not password:
+            import secrets
+
+            password = secrets.token_urlsafe(18)
+            generated = True
+        elif validate_password_strength(password):
+            logger.warning(
+                "DISTILL_ADMIN_PASSWORD is too weak (%s); generating a strong one instead",
+                validate_password_strength(password),
+            )
+            import secrets
+
+            password = secrets.token_urlsafe(18)
+            generated = True
+
+        admin = User(
+            email=email,
+            password_hash=hash_password(password),
+            display_name="管理员",
+            is_admin=True,
+            max_projects=999,
+            max_storage_mb=102400,
+        )
+        db.add(admin)
+        db.flush()
+        for project in db.scalars(select(Project).where(Project.owner_id.is_(None))).all():
+            project.owner_id = admin.id
+            db.add(project)
+        db.commit()
+        if generated:
+            # Printed once, on first boot only. Never logged again.
+            logger.warning(
+                "BOOTSTRAP ADMIN CREATED  email=%s  password=%s  "
+                "(sign in and change it immediately; set DISTILL_ADMIN_PASSWORD to control this)",
+                email,
+                password,
+            )
+        else:
+            logger.info("bootstrap admin created: %s", email)
+    finally:
+        db.close()
 
 
 def run_migrations() -> bool:

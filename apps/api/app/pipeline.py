@@ -205,7 +205,18 @@ def _audit(db: Session, project_id: str | None, action: str, detail: dict[str, A
 
 
 def create_job(db: Session, project_id: str, kind: str, config: dict[str, Any] | None = None) -> Job:
-    job = Job(project_id=project_id, kind=kind, config=config or {}, status="queued")
+    # Derive the owner from the project rather than trusting a caller argument,
+    # so a job can never be created under the wrong tenant.
+    from .models import Project
+
+    project = db.get(Project, project_id)
+    job = Job(
+        project_id=project_id,
+        owner_id=project.owner_id if project else None,
+        kind=kind,
+        config=config or {},
+        status="queued",
+    )
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -672,7 +683,7 @@ def _stage_extract(db: Session, job: Job, run: StageRun) -> dict[str, Any]:
     if provider and provider.enabled:
         mode = "llm"
         try:
-            adapter = get_adapter(provider)
+            adapter = get_adapter(provider, owner_id=job.owner_id or "")
         except Exception as exc:
             warnings.append(f"模型配置不可用，已回退启发式抽取：{exc}")
             adapter = None
@@ -1365,8 +1376,8 @@ def _stage_eval(db: Session, job: Job, run: StageRun) -> dict[str, Any]:
 
         if run_llm and provider:
             try:
-                generator = get_adapter(provider)
-                judge = get_adapter(provider)
+                generator = get_adapter(provider, owner_id=job.owner_id or "")
+                judge = get_adapter(provider, owner_id=job.owner_id or "")
                 eval_payload = evaluate_cases(
                     skill_name=skill.name,
                     skill_content=skill.content,
